@@ -6,23 +6,38 @@ const db = require('../config/database');
 const router = express.Router();
 
 // ---------------------------------------------------------------
+// Serialize all Drive API calls made from this file. The Google
+// auth library can throw a spurious "invalid_grant: Invalid JWT
+// Signature" when two calls request a token at nearly the same
+// instant (e.g. a manual save happening while the periodic Drive
+// sync is also running). Running everything through this queue
+// guarantees only one Drive call is ever in flight at a time.
+// ---------------------------------------------------------------
+let driveQueue = Promise.resolve();
+function runExclusive(fn) {
+  const result = driveQueue.then(fn, fn);
+  driveQueue = result.then(() => {}, () => {}); // never let a rejection break the chain
+  return result;
+}
+
+// ---------------------------------------------------------------
 // Helper: retry a Drive API call once if it fails with the
-// intermittent "invalid_grant: Invalid JWT Signature" error, which
-// is a known googleapis auth race condition under concurrent calls
-// rather than a real credentials problem. One retry after a short
-// delay almost always succeeds.
+// intermittent "invalid_grant: Invalid JWT Signature" error.
+// Combined with runExclusive above, this should be rare now.
 // ---------------------------------------------------------------
 async function withDriveRetry(fn, label) {
-  try {
-    return await fn();
-  } catch (err) {
-    const isJwtRace = err.message && err.message.includes('invalid_grant');
-    if (!isJwtRace) throw err;
+  return runExclusive(async () => {
+    try {
+      return await fn();
+    } catch (err) {
+      const isJwtRace = err.message && err.message.includes('invalid_grant');
+      if (!isJwtRace) throw err;
 
-    console.warn(`${label}: transient invalid_grant, retrying once...`);
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    return await fn();
-  }
+      console.warn(`${label}: transient invalid_grant, retrying once...`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return await fn();
+    }
+  });
 }
 
 // ---------------------------------------------------------------
@@ -49,8 +64,6 @@ async function backupCompanyToDrive(companyRow) {
         fields: 'id',
       });
     }, `backupCompanyToDrive(${companyRow.unique_id})`);
-
-    console.log(`Drive backup succeeded for ${companyRow.unique_id}`);
   } catch (err) {
     console.error(`Drive backup failed for ${companyRow.unique_id}:`, err.message);
   }
@@ -132,12 +145,12 @@ async function syncFromDrive() {
 
 let lastSyncTime = null;
 
-// Poll every 5 minutes. Adjust the interval as needed.
-const DRIVE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+// Poll every 10 minutes, and don't run the first sync until 2 minutes
+// after startup — this avoids colliding with manual testing right
+// after a deploy, which is what triggered the JWT race earlier.
+const DRIVE_SYNC_INTERVAL_MS = 10 * 60 * 1000;
 setInterval(syncFromDrive, DRIVE_SYNC_INTERVAL_MS);
-// Run once after startup, delayed enough to avoid colliding with any
-// requests that arrive right as the server comes up
-setTimeout(syncFromDrive, 30000);
+setTimeout(syncFromDrive, 2 * 60 * 1000);
 
 // ---------------------------------------------------------------
 // Make sure the companies table exists (runs once, harmless if

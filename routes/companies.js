@@ -1,7 +1,36 @@
 const express = require('express');
+const { Readable } = require('stream');
+const drive = require('../config/drive');
 const db = require('../config/database');
 
 const router = express.Router();
+
+// ---------------------------------------------------------------
+// Helper: push a JSON snapshot of a company record to Google Drive
+// as its own file, named after the unique_id (e.g. WC0001.json).
+// Failure here is logged but never blocks the API response — the
+// SQLite row is still the source of truth if Drive is briefly down.
+// ---------------------------------------------------------------
+async function backupCompanyToDrive(companyRow) {
+  try {
+    const jsonContent = JSON.stringify(companyRow, null, 2);
+    const stream = Readable.from([jsonContent]);
+
+    await drive.files.create({
+      requestBody: {
+        name: `${companyRow.unique_id}.json`,
+        parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
+      },
+      media: {
+        mimeType: 'application/json',
+        body: stream,
+      },
+      fields: 'id',
+    });
+  } catch (err) {
+    console.error(`Drive backup failed for ${companyRow.unique_id}:`, err.message);
+  }
+}
 
 // ---------------------------------------------------------------
 // Make sure the companies table exists (runs once, harmless if
@@ -24,6 +53,7 @@ db.exec(`
 
 // ---------------------------------------------------------------
 // GET /companies/next-id
+// Returns the next WC#### id based on the highest existing one
 // ---------------------------------------------------------------
 router.get('/next-id', (req, res) => {
   try {
@@ -69,6 +99,7 @@ router.get('/check-duplicate', (req, res) => {
 
 // ---------------------------------------------------------------
 // POST /companies
+// Body: { companyName, contactPerson, phone, email, address }
 // ---------------------------------------------------------------
 router.post('/', (req, res) => {
   try {
@@ -80,6 +111,7 @@ router.post('/', (req, res) => {
 
     const cleanName = companyName.trim();
 
+    // Duplicate check
     const dup = db.prepare(`
       SELECT 1 FROM companies WHERE LOWER(company_name) = LOWER(?) LIMIT 1
     `).get(cleanName);
@@ -88,6 +120,7 @@ router.post('/', (req, res) => {
       return res.status(409).json({ error: 'Duplicate company name' });
     }
 
+    // Generate next id
     const lastRow = db.prepare(`
       SELECT unique_id FROM companies
       WHERE unique_id LIKE 'WC%'
@@ -117,6 +150,9 @@ router.post('/', (req, res) => {
 
     const saved = db.prepare('SELECT * FROM companies WHERE id = ?').get(result.lastInsertRowid);
 
+    // Fire-and-forget: don't make the user wait on Drive before seeing success
+    backupCompanyToDrive(saved);
+
     res.status(201).json({
       uniqueId: saved.unique_id,
       companyName: saved.company_name,
@@ -124,6 +160,7 @@ router.post('/', (req, res) => {
     });
 
   } catch (err) {
+    // SQLite unique constraint race (two submits at once) lands here too
     console.error('POST /companies failed:', err);
     if (err.message && err.message.includes('UNIQUE')) {
       return res.status(409).json({ error: 'Duplicate company name or ID collision, please retry' });
@@ -133,7 +170,72 @@ router.post('/', (req, res) => {
 });
 
 // ---------------------------------------------------------------
+// PATCH /companies/:id
+// Update one or more fields of an existing company record.
+// Body can include any of: companyName, contactPerson, phone, email, address, status
+// ---------------------------------------------------------------
+router.patch('/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = db.prepare('SELECT * FROM companies WHERE id = ?').get(id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Company not found' });
+    }
+
+    const { companyName, contactPerson, phone, email, address, status } = req.body || {};
+
+    // If renaming, make sure the new name isn't already used by a different company
+    if (companyName && companyName.trim().toLowerCase() !== existing.company_name.toLowerCase()) {
+      const dup = db.prepare(`
+        SELECT 1 FROM companies WHERE LOWER(company_name) = LOWER(?) AND id != ? LIMIT 1
+      `).get(companyName.trim(), id);
+      if (dup) {
+        return res.status(409).json({ error: 'Another company already uses that name' });
+      }
+    }
+
+    const updated = {
+      company_name: companyName !== undefined ? companyName.trim() : existing.company_name,
+      contact_person: contactPerson !== undefined ? contactPerson.trim() : existing.contact_person,
+      phone: phone !== undefined ? phone.trim() : existing.phone,
+      email: email !== undefined ? email.trim() : existing.email,
+      address: address !== undefined ? address.trim() : existing.address,
+      status: status !== undefined ? status.trim() : existing.status,
+    };
+
+    db.prepare(`
+      UPDATE companies
+      SET company_name = ?, contact_person = ?, phone = ?, email = ?, address = ?, status = ?
+      WHERE id = ?
+    `).run(
+      updated.company_name,
+      updated.contact_person,
+      updated.phone,
+      updated.email,
+      updated.address,
+      updated.status,
+      id
+    );
+
+    const saved = db.prepare('SELECT * FROM companies WHERE id = ?').get(id);
+
+    // Refresh the Drive copy so it reflects the edit
+    backupCompanyToDrive(saved);
+
+    res.json(saved);
+
+  } catch (err) {
+    console.error('PATCH /companies/:id failed:', err);
+    if (err.message && err.message.includes('UNIQUE')) {
+      return res.status(409).json({ error: 'Duplicate company name' });
+    }
+    res.status(500).json({ error: 'Failed to update company', details: err.message });
+  }
+});
+
+// ---------------------------------------------------------------
 // GET /companies
+// List all companies
 // ---------------------------------------------------------------
 router.get('/', (req, res) => {
   try {

@@ -64,8 +64,16 @@ async function backupCompanyToDrive(companyRow) {
         fields: 'id',
       });
     }, `backupCompanyToDrive(${companyRow.unique_id})`);
+
+    console.log(`Drive backup succeeded for ${companyRow.unique_id}`);
   } catch (err) {
     console.error(`Drive backup failed for ${companyRow.unique_id}:`, err.message);
+    if (err.response && err.response.data) {
+      console.error('Full Google error response:', JSON.stringify(err.response.data));
+    }
+    if (err.stack) {
+      console.error('Stack:', err.stack);
+    }
   }
 }
 
@@ -170,6 +178,56 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   )
 `);
+
+// ---------------------------------------------------------------
+// GET /companies/drive-diagnostic
+// Isolated test: tries a few different Drive calls separately so
+// we can see exactly which one fails and with what detail.
+// ---------------------------------------------------------------
+router.get('/drive-diagnostic', async (req, res) => {
+  const results = {};
+
+  // Test 1: simplest possible authenticated call, no folder involved
+  try {
+    const about = await drive.about.get({ fields: 'user' });
+    results.aboutGet = { ok: true, user: about.data.user?.emailAddress };
+  } catch (err) {
+    results.aboutGet = { ok: false, message: err.message, detail: err.response?.data || null };
+  }
+
+  // Test 2: list files in the target folder (no write, just read)
+  try {
+    const list = await drive.files.list({
+      q: `'${process.env.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false`,
+      fields: 'files(id, name)',
+      pageSize: 5,
+    });
+    results.listFolder = { ok: true, fileCount: list.data.files?.length ?? 0 };
+  } catch (err) {
+    results.listFolder = { ok: false, message: err.message, detail: err.response?.data || null };
+  }
+
+  // Test 3: actually create a tiny test file in the folder
+  try {
+    const stream = Readable.from(['{"test":true}']);
+    const created = await drive.files.create({
+      requestBody: {
+        name: `diagnostic-test-${Date.now()}.json`,
+        parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
+      },
+      media: { mimeType: 'application/json', body: stream },
+      fields: 'id',
+    });
+    results.createFile = { ok: true, fileId: created.data.id };
+  } catch (err) {
+    results.createFile = { ok: false, message: err.message, detail: err.response?.data || null };
+  }
+
+  res.json({
+    folderIdUsed: process.env.GOOGLE_DRIVE_FOLDER_ID,
+    results,
+  });
+});
 
 // ---------------------------------------------------------------
 // GET /companies/next-id

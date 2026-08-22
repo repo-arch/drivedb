@@ -6,6 +6,26 @@ const db = require('../config/database');
 const router = express.Router();
 
 // ---------------------------------------------------------------
+// Helper: retry a Drive API call once if it fails with the
+// intermittent "invalid_grant: Invalid JWT Signature" error, which
+// is a known googleapis auth race condition under concurrent calls
+// rather than a real credentials problem. One retry after a short
+// delay almost always succeeds.
+// ---------------------------------------------------------------
+async function withDriveRetry(fn, label) {
+  try {
+    return await fn();
+  } catch (err) {
+    const isJwtRace = err.message && err.message.includes('invalid_grant');
+    if (!isJwtRace) throw err;
+
+    console.warn(`${label}: transient invalid_grant, retrying once...`);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    return await fn();
+  }
+}
+
+// ---------------------------------------------------------------
 // Helper: push a JSON snapshot of a company record to Google Drive
 // as its own file, named after the unique_id (e.g. WC0001.json).
 // Failure here is logged but never blocks the API response — the
@@ -14,19 +34,23 @@ const router = express.Router();
 async function backupCompanyToDrive(companyRow) {
   try {
     const jsonContent = JSON.stringify(companyRow, null, 2);
-    const stream = Readable.from([jsonContent]);
 
-    await drive.files.create({
-      requestBody: {
-        name: `${companyRow.unique_id}.json`,
-        parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
-      },
-      media: {
-        mimeType: 'application/json',
-        body: stream,
-      },
-      fields: 'id',
-    });
+    await withDriveRetry(() => {
+      const stream = Readable.from([jsonContent]);
+      return drive.files.create({
+        requestBody: {
+          name: `${companyRow.unique_id}.json`,
+          parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
+        },
+        media: {
+          mimeType: 'application/json',
+          body: stream,
+        },
+        fields: 'id',
+      });
+    }, `backupCompanyToDrive(${companyRow.unique_id})`);
+
+    console.log(`Drive backup succeeded for ${companyRow.unique_id}`);
   } catch (err) {
     console.error(`Drive backup failed for ${companyRow.unique_id}:`, err.message);
   }
@@ -39,11 +63,14 @@ async function backupCompanyToDrive(companyRow) {
 // ---------------------------------------------------------------
 async function syncFromDrive() {
   try {
-    const listRes = await drive.files.list({
-      q: `'${process.env.GOOGLE_DRIVE_FOLDER_ID}' in parents and name contains '.json' and trashed = false`,
-      fields: 'files(id, name, modifiedTime)',
-      pageSize: 1000,
-    });
+    const listRes = await withDriveRetry(
+      () => drive.files.list({
+        q: `'${process.env.GOOGLE_DRIVE_FOLDER_ID}' in parents and name contains '.json' and trashed = false`,
+        fields: 'files(id, name, modifiedTime)',
+        pageSize: 1000,
+      }),
+      'syncFromDrive.list'
+    );
 
     const files = listRes.data.files || [];
 
@@ -52,9 +79,12 @@ async function syncFromDrive() {
         // Only bother re-checking files modified since our last successful sync
         if (lastSyncTime && file.modifiedTime <= lastSyncTime) continue;
 
-        const contentRes = await drive.files.get(
-          { fileId: file.id, alt: 'media' },
-          { responseType: 'text' }
+        const contentRes = await withDriveRetry(
+          () => drive.files.get(
+            { fileId: file.id, alt: 'media' },
+            { responseType: 'text' }
+          ),
+          `syncFromDrive.get(${file.name})`
         );
 
         let parsed;
@@ -105,8 +135,9 @@ let lastSyncTime = null;
 // Poll every 5 minutes. Adjust the interval as needed.
 const DRIVE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 setInterval(syncFromDrive, DRIVE_SYNC_INTERVAL_MS);
-// Also run once shortly after startup
-setTimeout(syncFromDrive, 15000);
+// Run once after startup, delayed enough to avoid colliding with any
+// requests that arrive right as the server comes up
+setTimeout(syncFromDrive, 30000);
 
 // ---------------------------------------------------------------
 // Make sure the companies table exists (runs once, harmless if

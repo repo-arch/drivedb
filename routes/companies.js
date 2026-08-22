@@ -45,6 +45,13 @@ async function withDriveRetry(fn, label) {
 // as its own file, named after the unique_id (e.g. WC0001.json).
 // Failure here is logged but never blocks the API response — the
 // SQLite row is still the source of truth if Drive is briefly down.
+//
+// NOTE: supportsAllDrives: true is required because the target
+// folder lives inside a Shared Drive ("Crius Company DB"), not My
+// Drive. Without this flag the Drive API can't see the folder at
+// all, even when the service account has been shared Manager
+// access on it — Google returns a 404 "File not found" instead of
+// a permissions error, which is misleading.
 // ---------------------------------------------------------------
 async function backupCompanyToDrive(companyRow) {
   try {
@@ -62,6 +69,7 @@ async function backupCompanyToDrive(companyRow) {
           body: stream,
         },
         fields: 'id',
+        supportsAllDrives: true,
       });
     }, `backupCompanyToDrive(${companyRow.unique_id})`);
 
@@ -81,6 +89,9 @@ async function backupCompanyToDrive(companyRow) {
 // Helper: pull the latest content of every companyId.json file in
 // the Drive folder and write any changes back into SQLite.
 // Matches files by unique_id embedded in the JSON (or filename).
+//
+// Also updated with the Shared Drive flags (supportsAllDrives /
+// includeItemsFromAllDrives) on both the list and get calls.
 // ---------------------------------------------------------------
 async function syncFromDrive() {
   try {
@@ -89,6 +100,8 @@ async function syncFromDrive() {
         q: `'${process.env.GOOGLE_DRIVE_FOLDER_ID}' in parents and name contains '.json' and trashed = false`,
         fields: 'files(id, name, modifiedTime)',
         pageSize: 1000,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
       }),
       'syncFromDrive.list'
     );
@@ -102,7 +115,7 @@ async function syncFromDrive() {
 
         const contentRes = await withDriveRetry(
           () => drive.files.get(
-            { fileId: file.id, alt: 'media' },
+            { fileId: file.id, alt: 'media', supportsAllDrives: true },
             { responseType: 'text' }
           ),
           `syncFromDrive.get(${file.name})`
@@ -180,6 +193,26 @@ db.exec(`
 `);
 
 // ---------------------------------------------------------------
+// Startup check: confirm the Drive folder is actually reachable
+// as soon as the server boots, instead of discovering the problem
+// company-by-company in the logs later. Logs a clear warning (not
+// a crash) if it fails, since Drive being briefly unreachable
+// shouldn't stop the app from serving requests.
+// ---------------------------------------------------------------
+(async () => {
+  try {
+    const check = await drive.files.get({
+      fileId: process.env.GOOGLE_DRIVE_FOLDER_ID,
+      fields: 'id, name',
+      supportsAllDrives: true,
+    });
+    console.log(`Drive folder OK: ${check.data.name} (${process.env.GOOGLE_DRIVE_FOLDER_ID})`);
+  } catch (err) {
+    console.error('WARNING: Drive folder is not accessible at startup —', err.message);
+  }
+})();
+
+// ---------------------------------------------------------------
 // GET /companies/drive-diagnostic
 // Isolated test: tries a few different Drive calls separately so
 // we can see exactly which one fails and with what detail.
@@ -201,6 +234,8 @@ router.get('/drive-diagnostic', async (req, res) => {
       q: `'${process.env.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false`,
       fields: 'files(id, name)',
       pageSize: 5,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
     });
     results.listFolder = { ok: true, fileCount: list.data.files?.length ?? 0 };
   } catch (err) {
@@ -217,6 +252,7 @@ router.get('/drive-diagnostic', async (req, res) => {
       },
       media: { mimeType: 'application/json', body: stream },
       fields: 'id',
+      supportsAllDrives: true,
     });
     results.createFile = { ok: true, fileId: created.data.id };
   } catch (err) {

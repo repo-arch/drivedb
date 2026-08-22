@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS companies (
 CREATE INDEX IF NOT EXISTS idx_companies_name_lower
   ON companies (LOWER(company_name));
 */
+const express = require('express');
+const db = require('../config/database');
 
+const router = express.Router();
 // ---- GET /companies/next-id ----
 // Returns the next WC#### id based on the highest existing unique_id.
 router.get('/companies/next-id', async (req, res) => {

@@ -33,6 +33,82 @@ async function backupCompanyToDrive(companyRow) {
 }
 
 // ---------------------------------------------------------------
+// Helper: pull the latest content of every companyId.json file in
+// the Drive folder and write any changes back into SQLite.
+// Matches files by unique_id embedded in the JSON (or filename).
+// ---------------------------------------------------------------
+async function syncFromDrive() {
+  try {
+    const listRes = await drive.files.list({
+      q: `'${process.env.GOOGLE_DRIVE_FOLDER_ID}' in parents and name contains '.json' and trashed = false`,
+      fields: 'files(id, name, modifiedTime)',
+      pageSize: 1000,
+    });
+
+    const files = listRes.data.files || [];
+
+    for (const file of files) {
+      try {
+        // Only bother re-checking files modified since our last successful sync
+        if (lastSyncTime && file.modifiedTime <= lastSyncTime) continue;
+
+        const contentRes = await drive.files.get(
+          { fileId: file.id, alt: 'media' },
+          { responseType: 'text' }
+        );
+
+        let parsed;
+        try {
+          parsed = typeof contentRes.data === 'string'
+            ? JSON.parse(contentRes.data)
+            : contentRes.data;
+        } catch (parseErr) {
+          console.error(`Skipping ${file.name}: not valid JSON (${parseErr.message})`);
+          continue;
+        }
+
+        const uniqueId = parsed.unique_id || file.name.replace(/\.json$/i, '');
+        const existing = db.prepare('SELECT * FROM companies WHERE unique_id = ?').get(uniqueId);
+        if (!existing) {
+          console.log(`Skipping ${file.name}: no matching company with unique_id ${uniqueId}`);
+          continue;
+        }
+
+        db.prepare(`
+          UPDATE companies
+          SET company_name = ?, contact_person = ?, phone = ?, email = ?, address = ?, status = ?
+          WHERE unique_id = ?
+        `).run(
+          parsed.company_name ?? existing.company_name,
+          parsed.contact_person ?? existing.contact_person,
+          parsed.phone ?? existing.phone,
+          parsed.email ?? existing.email,
+          parsed.address ?? existing.address,
+          parsed.status ?? existing.status,
+          uniqueId
+        );
+
+        console.log(`Synced ${uniqueId} from Drive edit (${file.name})`);
+      } catch (fileErr) {
+        console.error(`Failed syncing ${file.name}:`, fileErr.message);
+      }
+    }
+
+    lastSyncTime = new Date().toISOString();
+  } catch (err) {
+    console.error('Drive → DB sync failed:', err.message);
+  }
+}
+
+let lastSyncTime = null;
+
+// Poll every 5 minutes. Adjust the interval as needed.
+const DRIVE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(syncFromDrive, DRIVE_SYNC_INTERVAL_MS);
+// Also run once shortly after startup
+setTimeout(syncFromDrive, 15000);
+
+// ---------------------------------------------------------------
 // Make sure the companies table exists (runs once, harmless if
 // it already exists). Mirrors however config/database.js already
 // creates the "files" table.
@@ -230,6 +306,20 @@ router.patch('/:id', (req, res) => {
       return res.status(409).json({ error: 'Duplicate company name' });
     }
     res.status(500).json({ error: 'Failed to update company', details: err.message });
+  }
+});
+
+// ---------------------------------------------------------------
+// POST /companies/sync-from-drive
+// Manually trigger a Drive → DB sync right now (for testing, or a
+// "Refresh from Drive" button in an admin UI)
+// ---------------------------------------------------------------
+router.post('/sync-from-drive', async (req, res) => {
+  try {
+    await syncFromDrive();
+    res.json({ synced: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Sync failed', details: err.message });
   }
 });
 
